@@ -1,0 +1,77 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-22.04
+          - arch: aarch64
+            runner: ubuntu-22.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the tag matches VERSION
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: test "v$(cat VERSION)" = "${GITHUB_REF_NAME}" || { echo "tag ${GITHUB_REF_NAME} but VERSION says $(cat VERSION)"; exit 1; }
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential pkg-config libpipewire-0.3-dev
+
+      - name: Test
+        run: make test
+
+      - name: Build
+        run: make LDFLAGS="-static-libstdc++ -static-libgcc -s"
+
+      - name: Check the binary runs
+        run: |
+          ./serpantinum-audio version
+          rc=0
+          ./serpantinum-audio >/dev/null 2>&1 || rc=$?
+          test "$rc" -eq 64
+
+      - name: Package
+        run: |
+          version=$(cat VERSION)
+          make install DESTDIR="$PWD/stage" PREFIX=/usr
+          mkdir -p dist
+          tar -C stage -czf "dist/serpantinum-audio-${version}-${{ matrix.arch }}-linux.tar.gz" usr
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.arch }}
+          path: dist/*
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          files: dist/*
+          generate_release_notes: true

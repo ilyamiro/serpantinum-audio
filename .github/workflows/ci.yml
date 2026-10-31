@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: arch
+            image: archlinux:latest
+            deps: pacman -Syu --noconfirm --needed base-devel pipewire
+          - name: fedora
+            image: fedora:latest
+            deps: dnf install -y gcc-c++ make pkgconf-pkg-config pipewire-devel
+          - name: void
+            image: ghcr.io/void-linux/void-glibc-full:latest
+            deps: xbps-install -Syu xbps && xbps-install -Syu && xbps-install -y gcc make pkg-config pipewire-devel bash
+          - name: ubuntu-22.04
+            image: ubuntu:22.04
+            deps: apt-get update && apt-get install -y build-essential pkg-config libpipewire-0.3-dev
+    defaults:
+      run:
+        shell: sh
+    steps:
+      - name: Install build dependencies
+        run: ${{ matrix.deps }}
+
+      - uses: actions/checkout@v4
+
+      - name: Test
+        run: make test
+
+      - name: Build
+        run: make
+
+      - name: Check the binary runs
+        run: |
+          ./serpantinum-audio version
+          rc=0
+          ./serpantinum-audio >/dev/null 2>&1 || rc=$?
+          test "$rc" -eq 64
