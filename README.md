@@ -108,6 +108,14 @@ sudo make install
 ffmpeg -i track.mp3 -f f32le -ac 2 -ar 48000 - | ./eval
 ```
 
+### Nix
+
+```nix
+environment.systemPackages = [ (import (builtins.fetchTarball "https://github.com/ilyamiro/serpantinum-audio/archive/master.tar.gz") { inherit pkgs; }) ];
+```
+
+The Serpantinum flake already includes it.
+
 ## Releases
 
 Pushing a `v*` tag that matches `VERSION` builds `x86_64` and `aarch64` binaries on Ubuntu 24.04, so they run on any distribution with glibc 2.39 and PipeWire 0.3.49 or newer, and publishes them with a `SHA256SUMS` file. Each archive holds `usr/bin/serpantinum-audio` and the license.
