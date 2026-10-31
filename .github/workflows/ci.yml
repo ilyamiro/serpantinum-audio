@@ -24,8 +24,8 @@ jobs:
           - name: void
             image: ghcr.io/void-linux/void-glibc-full:latest
             deps: xbps-install -Syu xbps && xbps-install -Syu && xbps-install -y gcc make pkg-config pipewire-devel bash
-          - name: ubuntu-22.04
-            image: ubuntu:22.04
+          - name: ubuntu-24.04
+            image: ubuntu:24.04
             deps: apt-get update && apt-get install -y build-essential pkg-config libpipewire-0.3-dev
     defaults:
       run:

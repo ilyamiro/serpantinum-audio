@@ -110,7 +110,7 @@ ffmpeg -i track.mp3 -f f32le -ac 2 -ar 48000 - | ./eval
 
 ## Releases
 
-Pushing a `v*` tag that matches `VERSION` builds `x86_64` and `aarch64` binaries on Ubuntu 22.04, so they run on any distribution with glibc 2.35 or newer, and publishes them with a `SHA256SUMS` file. Each archive holds `usr/bin/serpantinum-audio` and the license.
+Pushing a `v*` tag that matches `VERSION` builds `x86_64` and `aarch64` binaries on Ubuntu 24.04, so they run on any distribution with glibc 2.39 and PipeWire 0.3.49 or newer, and publishes them with a `SHA256SUMS` file. Each archive holds `usr/bin/serpantinum-audio` and the license.
 
 ## License
 
