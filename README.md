@@ -12,7 +12,7 @@ It creates a virtual output called **Serpantinum** (`serpantinum_sink`), process
 - Dynamic EQ, an adaptive tonal balance that follows the music
 - Global bypass
 
-When the daemon starts it becomes the default output and follows the device you pick: choosing another output moves the processed audio there. Your previous default is restored when it stops.
+The daemon leaves your default output alone. Like EasyEffects, it moves each app's playback stream onto its sink and plays the processed result on whatever the default output is, so choosing another output moves the processed audio there. A stream that names its own device, or one you move to another device yourself, is left where it is. When the daemon stops, apps go back to the default output.
 
 ## Usage
 
@@ -36,7 +36,7 @@ Without arguments it prints the usage and exits with status 64.
 | `mono`, `swap`, `bypass`, `dyneq` | `1`/`0` or `true`/`false` |
 | `dynamics` | `off`, `balanced` or `night` |
 | `get` | prints the current settings as a `set` line |
-| `status` | prints the sink, the current output device, the underrun count and the settings |
+| `status` | prints the sink, the current output device, the number of routed streams, the underrun count and the settings |
 | `ping` | answers `ok` |
 | `quit` | stops the daemon |
 

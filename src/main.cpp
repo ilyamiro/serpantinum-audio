@@ -16,6 +16,7 @@
 #include <cstring>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <string>
@@ -31,8 +32,11 @@
 namespace {
 
 constexpr const char* kSinkName = "serpantinum_sink";
+constexpr const char* kOutputName = "serpantinum_output";
 constexpr const char* kConfiguredKey = "default.configured.audio.sink";
 constexpr const char* kResolvedKey = "default.audio.sink";
+constexpr const char* kTargetObjectKey = "target.object";
+constexpr const char* kTargetNodeKey = "target.node";
 constexpr uint32_t kRate = 48000;
 constexpr uint32_t kChannels = 2;
 constexpr uint32_t kStride = sizeof(float) * kChannels;
@@ -143,6 +147,7 @@ public:
 
         registry_ = pw_core_get_registry(core_, PW_VERSION_REGISTRY, 0);
         pw_registry_add_listener(registry_, &registryListener_, &registryEventsTable(), this);
+        syncSeq_ = pw_core_sync(core_, PW_ID_CORE, 0);
 
         createSink();
 
@@ -154,6 +159,25 @@ public:
 
 private:
     static void onSignal(void* data, int) { pw_main_loop_quit(static_cast<Daemon*>(data)->loop_); }
+
+    static void onCoreDone(void* data, uint32_t id, int seq) {
+        Daemon* self = static_cast<Daemon*>(data);
+        if (id != PW_ID_CORE) return;
+        if (seq == self->shutdownSeq_) self->shutdownDone_ = true;
+        if (self->synced_ || seq != self->syncSeq_) return;
+        if (++self->syncRounds_ < 2) {
+            self->syncSeq_ = pw_core_sync(self->core_, PW_ID_CORE, 0);
+            return;
+        }
+        self->synced_ = true;
+        self->onSynced();
+    }
+
+    void onSynced() {
+        if (metadata_ && configuredName_ == kSinkName)
+            pw_metadata_set_property(metadata_, PW_ID_CORE, kConfiguredKey, nullptr, nullptr);
+        for (auto& entry : streams_) route(entry.first);
+    }
 
     static void onCoreError(void* data, uint32_t id, int, int res, const char* message) {
         if (id == PW_ID_CORE && res == -EPIPE) {
@@ -227,8 +251,12 @@ private:
             return "ok";
         }
         if (line == "status") {
+            unsigned routed = 0;
+            for (const auto& entry : streams_)
+                if (entry.second.routed) ++routed;
             return "ok sink=" + std::string(kSinkName) + " target=" + (target_.empty() ? "-" : target_) +
-                   " underruns=" + std::to_string(underruns_.load()) + " " + sa::serialize(params_);
+                   " streams=" + std::to_string(routed) + " underruns=" + std::to_string(underruns_.load()) + " " +
+                   sa::serialize(params_);
         }
         if (line == "get") return sa::serialize(params_);
         if (!sa::applyCommand(params_, line)) return "error";
@@ -331,7 +359,7 @@ private:
         destroyOutput();
         ring_.clear();
         primed_ = false;
-        pw_properties* props = streamProps("serpantinum_output", "Serpantinum output");
+        pw_properties* props = streamProps(kOutputName, "Serpantinum output");
         pw_properties_set(props, PW_KEY_MEDIA_CLASS, "Stream/Output/Audio");
         pw_properties_set(props, PW_KEY_MEDIA_TYPE, "Audio");
         pw_properties_set(props, PW_KEY_MEDIA_CATEGORY, "Playback");
@@ -344,7 +372,7 @@ private:
         outEvents_.version = PW_VERSION_STREAM_EVENTS;
         outEvents_.process = onOutProcess;
         outEvents_.state_changed = onStreamState;
-        out_ = pw_stream_new(core_, "serpantinum_output", props);
+        out_ = pw_stream_new(core_, kOutputName, props);
         pw_stream_add_listener(out_, &outListener_, &outEvents_, this);
         if (!connectStream(out_, PW_DIRECTION_OUTPUT)) std::fprintf(stderr, "serpantinum-audio: output connect failed\n");
         target_ = target;
@@ -384,45 +412,181 @@ private:
                 self->metadata_ = static_cast<pw_metadata*>(
                     pw_registry_bind(self->registry_, id, type, PW_VERSION_METADATA, 0));
                 pw_metadata_add_listener(self->metadata_, &self->metadataListener_, &metadataEventsTable(), self);
+                if (self->synced_) {
+                    self->synced_ = false;
+                    self->syncRounds_ = 1;
+                    self->syncSeq_ = pw_core_sync(self->core_, PW_ID_CORE, 0);
+                }
             }
         } else if (std::strcmp(type, PW_TYPE_INTERFACE_Node) == 0) {
             const char* cls = spa_dict_lookup(props, PW_KEY_MEDIA_CLASS);
             const char* name = spa_dict_lookup(props, PW_KEY_NODE_NAME);
-            if (cls && name && std::strcmp(cls, "Audio/Sink") == 0 && std::strcmp(name, kSinkName) != 0) {
+            const char* serial = spa_dict_lookup(props, PW_KEY_OBJECT_SERIAL);
+            if (!cls || !name) return;
+            if (std::strcmp(cls, "Audio/Sink") == 0) {
+                if (std::strcmp(name, kSinkName) == 0) {
+                    self->ownId_ = id;
+                    self->ownSerial_ = serial ? serial : "";
+                    return;
+                }
                 self->sinkNodes_[id] = name;
-                if (self->target_.empty() || self->userChoice_ == name) self->adoptTarget(name);
+                if (serial) self->sinkSerials_[id] = serial;
+                if (self->target_.empty() || self->defaultName_ == name) self->adoptTarget(name);
+            } else if (std::strcmp(cls, "Stream/Output/Audio") == 0 && std::strcmp(name, kOutputName) != 0) {
+                self->probe(id, type);
             }
+        }
+    }
+
+    struct Probe {
+        Daemon* self = nullptr;
+        uint32_t id = 0;
+        pw_proxy* proxy = nullptr;
+        spa_hook listener{};
+        bool decided = false;
+    };
+
+    void probe(uint32_t id, const char* type) {
+        auto p = std::make_unique<Probe>();
+        p->self = this;
+        p->id = id;
+        p->proxy = static_cast<pw_proxy*>(pw_registry_bind(registry_, id, type, PW_VERSION_NODE, 0));
+        if (!p->proxy) return;
+        pw_node_add_listener(reinterpret_cast<pw_node*>(p->proxy), &p->listener, &nodeEventsTable(), p.get());
+        probes_[id] = std::move(p);
+    }
+
+    void dropProbe(uint32_t id) {
+        auto it = probes_.find(id);
+        if (it == probes_.end()) return;
+        spa_hook_remove(&it->second->listener);
+        pw_proxy_destroy(it->second->proxy);
+        probes_.erase(it);
+    }
+
+    static void onNodeInfo(void* data, const pw_node_info* info) {
+        Probe* p = static_cast<Probe*>(data);
+        if (p->decided || !info || !info->props) return;
+        p->decided = true;
+        Daemon* self = p->self;
+        if (!routable(info->props)) return;
+        self->streams_[p->id] = {};
+        if (self->synced_) self->route(p->id);
+    }
+
+    static bool isTrue(const char* value) { return value && (std::strcmp(value, "true") == 0 || std::strcmp(value, "1") == 0); }
+
+    static bool routable(const spa_dict* props) {
+        const char* name = spa_dict_lookup(props, PW_KEY_NODE_NAME);
+        if (name && std::strcmp(name, kOutputName) == 0) return false;
+        if (spa_dict_lookup(props, PW_KEY_NODE_LINK_GROUP)) return false;
+        if (spa_dict_lookup(props, kTargetObjectKey) || spa_dict_lookup(props, kTargetNodeKey) ||
+            spa_dict_lookup(props, "node.target"))
+            return false;
+        const char* autoconnect = spa_dict_lookup(props, PW_KEY_NODE_AUTOCONNECT);
+        if (autoconnect && !isTrue(autoconnect)) return false;
+        return !isTrue(spa_dict_lookup(props, "node.dont-move"));
+    }
+
+    bool isOwnTarget(const std::string& value) const {
+        if (value.empty()) return false;
+        return value == kSinkName || (!ownSerial_.empty() && value == ownSerial_) ||
+               (ownId_ != SPA_ID_INVALID && value == std::to_string(ownId_));
+    }
+
+    bool isOtherSink(const std::string& value) const {
+        if (value.empty()) return false;
+        for (const auto& entry : sinkNodes_)
+            if (entry.second == value || std::to_string(entry.first) == value) return true;
+        for (const auto& entry : sinkSerials_)
+            if (entry.second == value) return true;
+        return false;
+    }
+
+    void route(uint32_t id) {
+        auto it = streams_.find(id);
+        if (it == streams_.end() || !metadata_) return;
+        StreamState& s = it->second;
+        if (s.routed || s.pinned) return;
+        const auto pinned = streamTargets_.find(id);
+        if (pinned != streamTargets_.end() && isOtherSink(pinned->second)) {
+            s.pinned = true;
+            return;
+        }
+        s.routed = true;
+        pw_metadata_set_property(metadata_, id, kTargetObjectKey, "Spa:String", kSinkName);
+    }
+
+    void unrouteAll() {
+        if (!metadata_) return;
+        for (auto& entry : streams_) {
+            if (!entry.second.routed) continue;
+            pw_metadata_set_property(metadata_, entry.first, kTargetObjectKey, nullptr, nullptr);
+            entry.second.routed = false;
+        }
+    }
+
+    void onStreamTarget(uint32_t subject, const char* value) {
+        const std::string v = value ? value : "";
+        if (v.empty()) {
+            streamTargets_.erase(subject);
+        } else {
+            streamTargets_[subject] = v;
+        }
+        auto it = streams_.find(subject);
+        if (it == streams_.end()) return;
+        StreamState& s = it->second;
+        if (isOwnTarget(v)) {
+            s.routed = true;
+            s.pinned = false;
+        } else if (isOtherSink(v)) {
+            s.routed = false;
+            s.pinned = true;
+        } else if (v.empty() && (s.routed || s.pinned)) {
+            s.routed = false;
+            s.pinned = false;
+            if (synced_) route(subject);
         }
     }
 
     static void onGlobalRemove(void* data, uint32_t id) {
         Daemon* self = static_cast<Daemon*>(data);
+        self->dropProbe(id);
+        self->streams_.erase(id);
+        self->streamTargets_.erase(id);
+        self->sinkSerials_.erase(id);
+        if (id == self->ownId_) {
+            self->ownId_ = SPA_ID_INVALID;
+            self->ownSerial_.clear();
+        }
         auto it = self->sinkNodes_.find(id);
         if (it == self->sinkNodes_.end()) return;
         const std::string gone = it->second;
         self->sinkNodes_.erase(it);
         if (gone != self->target_) return;
         self->destroyOutput();
-        if (self->sinkNodes_.empty()) {
-            self->releaseDefault();
-            return;
-        }
-        self->adoptTarget(self->sinkNodes_.begin()->second);
+        if (self->sinkNodes_.empty()) return;
+        self->adoptTarget(self->hasSink(self->defaultName_) ? self->defaultName_ : self->sinkNodes_.begin()->second);
     }
 
     static int onMetadataProperty(void* data, uint32_t subject, const char* key, const char*, const char* value) {
         Daemon* self = static_cast<Daemon*>(data);
-        if (subject != PW_ID_CORE || !key) return 0;
+        if (!key) {
+            if (subject != PW_ID_CORE) self->onStreamTarget(subject, nullptr);
+            return 0;
+        }
+        if (subject != PW_ID_CORE) {
+            if (std::strcmp(key, kTargetObjectKey) == 0 || std::strcmp(key, kTargetNodeKey) == 0)
+                self->onStreamTarget(subject, value);
+            return 0;
+        }
         if (std::strcmp(key, kConfiguredKey) == 0) {
-            const std::string name = jsonName(value);
-            if (name != kSinkName) {
-                self->original_ = value ? value : "";
-                self->userChoice_ = name;
-                if (!name.empty() && self->hasSink(name)) self->adoptTarget(name);
-            }
+            self->configuredName_ = jsonName(value);
         } else if (std::strcmp(key, kResolvedKey) == 0) {
             const std::string name = jsonName(value);
-            if (!name.empty() && name != kSinkName) self->adoptTarget(name);
+            if (name == kSinkName) return 0;
+            self->defaultName_ = name;
+            if (!name.empty() && self->hasSink(name)) self->adoptTarget(name);
         }
         return 0;
     }
@@ -435,32 +599,16 @@ private:
 
     void adoptTarget(const std::string& name) {
         if (name != target_ || !out_) createOutput(name);
-        claimDefault();
-    }
-
-    void claimDefault() {
-        if (!metadata_) return;
-        const std::string value = std::string("{\"name\":\"") + kSinkName + "\"}";
-        pw_metadata_set_property(metadata_, PW_ID_CORE, kConfiguredKey, "Spa:String:JSON", value.c_str());
-        claimed_ = true;
-    }
-
-    void releaseDefault() {
-        if (!metadata_ || !claimed_) return;
-        if (!original_.empty()) {
-            pw_metadata_set_property(metadata_, PW_ID_CORE, kConfiguredKey, "Spa:String:JSON", original_.c_str());
-        } else {
-            pw_metadata_set_property(metadata_, PW_ID_CORE, kConfiguredKey, nullptr, nullptr);
-        }
-        claimed_ = false;
     }
 
     void shutdown() {
-        releaseDefault();
         if (metadata_) {
-            pw_core_sync(core_, PW_ID_CORE, 0);
-            pw_loop_iterate(pw_main_loop_get_loop(loop_), 50);
+            unrouteAll();
+            shutdownDone_ = false;
+            shutdownSeq_ = pw_core_sync(core_, PW_ID_CORE, 0);
+            for (int i = 0; i < 20 && !shutdownDone_; ++i) pw_loop_iterate(pw_main_loop_get_loop(loop_), 50);
         }
+        while (!probes_.empty()) dropProbe(probes_.begin()->first);
         destroyOutput();
         if (sink_) {
             spa_hook_remove(&sinkListener_);
@@ -482,6 +630,7 @@ private:
         static const pw_core_events t = [] {
             pw_core_events e{};
             e.version = PW_VERSION_CORE_EVENTS;
+            e.done = onCoreDone;
             e.error = onCoreError;
             return e;
         }();
@@ -494,6 +643,16 @@ private:
             e.version = PW_VERSION_REGISTRY_EVENTS;
             e.global = onGlobal;
             e.global_remove = onGlobalRemove;
+            return e;
+        }();
+        return t;
+    }
+
+    static const pw_node_events& nodeEventsTable() {
+        static const pw_node_events t = [] {
+            pw_node_events e{};
+            e.version = PW_VERSION_NODE_EVENTS;
+            e.info = onNodeInfo;
             return e;
         }();
         return t;
@@ -521,11 +680,26 @@ private:
     spa_source* socketSource_ = nullptr;
     int listenFd_ = -1;
 
+    struct StreamState {
+        bool routed = false;
+        bool pinned = false;
+    };
+
     std::map<uint32_t, std::string> sinkNodes_;
+    std::map<uint32_t, std::string> sinkSerials_;
+    std::map<uint32_t, StreamState> streams_;
+    std::map<uint32_t, std::unique_ptr<Probe>> probes_;
+    std::map<uint32_t, std::string> streamTargets_;
     std::string target_;
-    std::string original_;
-    std::string userChoice_;
-    bool claimed_ = false;
+    std::string defaultName_;
+    std::string configuredName_;
+    uint32_t ownId_ = SPA_ID_INVALID;
+    std::string ownSerial_;
+    int syncSeq_ = -1;
+    int syncRounds_ = 0;
+    int shutdownSeq_ = -1;
+    bool synced_ = false;
+    bool shutdownDone_ = false;
 
     sa::FrameRing ring_;
     sa::Chain chain_;
