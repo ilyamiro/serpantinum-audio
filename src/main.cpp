@@ -176,6 +176,7 @@ private:
     void onSynced() {
         if (metadata_ && configuredName_ == kSinkName)
             pw_metadata_set_property(metadata_, PW_ID_CORE, kConfiguredKey, nullptr, nullptr);
+        refreshTarget();
         for (auto& entry : streams_) route(entry.first);
     }
 
@@ -299,6 +300,7 @@ private:
         float* dst = static_cast<float*>(d.data);
 
         if (!primed_ && ring_.available() >= frames) primed_ = true;
+        if (primed_) ring_.trim(frames * 4);
         size_t got = primed_ ? ring_.pop(dst, frames) : 0;
         if (primed_ && got < frames) underruns_.fetch_add(1, std::memory_order_relaxed);
         if (got < frames) std::memset(dst + got * 2, 0, (frames - got) * kStride);
@@ -345,6 +347,7 @@ private:
         pw_properties* props = streamProps(kSinkName, "Serpantinum");
         pw_properties_set(props, PW_KEY_MEDIA_CLASS, "Audio/Sink");
         pw_properties_set(props, PW_KEY_NODE_VIRTUAL, "true");
+        pw_properties_set(props, PW_KEY_PRIORITY_SESSION, "0");
         pw_properties_set(props, PW_KEY_MEDIA_NAME, "Serpantinum sink");
         sinkEvents_ = {};
         sinkEvents_.version = PW_VERSION_STREAM_EVENTS;
@@ -393,8 +396,8 @@ private:
         makeDirs(dir);
         const std::string tmp = dir + "/audio-target.tmp";
         uint32_t id = 0;
-        for (const auto& entry : sinkNodes_)
-            if (entry.second == target_) id = entry.first;
+        for (const auto& entry : sinks_)
+            if (entry.second.name == target_) id = entry.first;
         {
             std::ofstream f(tmp, std::ios::trunc);
             f << target_ << '\n';
@@ -429,9 +432,12 @@ private:
                     self->ownSerial_ = serial ? serial : "";
                     return;
                 }
-                self->sinkNodes_[id] = name;
-                if (serial) self->sinkSerials_[id] = serial;
-                if (self->target_.empty() || self->defaultName_ == name) self->adoptTarget(name);
+                const char* priority = spa_dict_lookup(props, PW_KEY_PRIORITY_SESSION);
+                SinkInfo& sink = self->sinks_[id];
+                sink.name = name;
+                sink.serial = serial ? serial : "";
+                sink.priority = priority ? std::atoi(priority) : 0;
+                if (self->synced_) self->refreshTarget();
             } else if (std::strcmp(cls, "Stream/Output/Audio") == 0 && std::strcmp(name, kOutputName) != 0) {
                 self->probe(id, type);
             }
@@ -469,20 +475,21 @@ private:
         if (p->decided || !info || !info->props) return;
         p->decided = true;
         Daemon* self = p->self;
-        if (!routable(info->props)) return;
+        if (!self->routable(info->props)) return;
         self->streams_[p->id] = {};
         if (self->synced_) self->route(p->id);
     }
 
     static bool isTrue(const char* value) { return value && (std::strcmp(value, "true") == 0 || std::strcmp(value, "1") == 0); }
 
-    static bool routable(const spa_dict* props) {
+    bool routable(const spa_dict* props) const {
         const char* name = spa_dict_lookup(props, PW_KEY_NODE_NAME);
         if (name && std::strcmp(name, kOutputName) == 0) return false;
         if (spa_dict_lookup(props, PW_KEY_NODE_LINK_GROUP)) return false;
-        if (spa_dict_lookup(props, kTargetObjectKey) || spa_dict_lookup(props, kTargetNodeKey) ||
-            spa_dict_lookup(props, "node.target"))
-            return false;
+        for (const char* key : {kTargetObjectKey, kTargetNodeKey, "node.target"}) {
+            const char* target = spa_dict_lookup(props, key);
+            if (target && !isOwnTarget(target) && !isCurrentOutput(target)) return false;
+        }
         const char* autoconnect = spa_dict_lookup(props, PW_KEY_NODE_AUTOCONNECT);
         if (autoconnect && !isTrue(autoconnect)) return false;
         return !isTrue(spa_dict_lookup(props, "node.dont-move"));
@@ -494,12 +501,21 @@ private:
                (ownId_ != SPA_ID_INVALID && value == std::to_string(ownId_));
     }
 
+    static bool matchesSink(const std::string& value, uint32_t id, const std::string& name, const std::string& serial) {
+        return !value.empty() && (value == name || value == std::to_string(id) || (!serial.empty() && value == serial));
+    }
+
     bool isOtherSink(const std::string& value) const {
-        if (value.empty()) return false;
-        for (const auto& entry : sinkNodes_)
-            if (entry.second == value || std::to_string(entry.first) == value) return true;
-        for (const auto& entry : sinkSerials_)
-            if (entry.second == value) return true;
+        for (const auto& entry : sinks_)
+            if (matchesSink(value, entry.first, entry.second.name, entry.second.serial)) return true;
+        return false;
+    }
+
+    bool isCurrentOutput(const std::string& value) const {
+        if (target_.empty()) return false;
+        for (const auto& entry : sinks_)
+            if (entry.second.name == target_ && matchesSink(value, entry.first, entry.second.name, entry.second.serial))
+                return true;
         return false;
     }
 
@@ -554,19 +570,15 @@ private:
         self->dropProbe(id);
         self->streams_.erase(id);
         self->streamTargets_.erase(id);
-        self->sinkSerials_.erase(id);
         if (id == self->ownId_) {
             self->ownId_ = SPA_ID_INVALID;
             self->ownSerial_.clear();
         }
-        auto it = self->sinkNodes_.find(id);
-        if (it == self->sinkNodes_.end()) return;
-        const std::string gone = it->second;
-        self->sinkNodes_.erase(it);
-        if (gone != self->target_) return;
-        self->destroyOutput();
-        if (self->sinkNodes_.empty()) return;
-        self->adoptTarget(self->hasSink(self->defaultName_) ? self->defaultName_ : self->sinkNodes_.begin()->second);
+        auto it = self->sinks_.find(id);
+        if (it == self->sinks_.end()) return;
+        const std::string gone = it->second.name;
+        self->sinks_.erase(it);
+        if (gone == self->target_ && self->synced_) self->refreshTarget();
     }
 
     static int onMetadataProperty(void* data, uint32_t subject, const char* key, const char*, const char* value) {
@@ -583,18 +595,46 @@ private:
         if (std::strcmp(key, kConfiguredKey) == 0) {
             self->configuredName_ = jsonName(value);
         } else if (std::strcmp(key, kResolvedKey) == 0) {
-            const std::string name = jsonName(value);
-            if (name == kSinkName) return 0;
-            self->defaultName_ = name;
-            if (!name.empty() && self->hasSink(name)) self->adoptTarget(name);
+            self->defaultName_ = jsonName(value);
+            if (self->synced_) self->refreshTarget();
         }
         return 0;
     }
 
     bool hasSink(const std::string& name) const {
-        for (const auto& entry : sinkNodes_)
-            if (entry.second == name) return true;
+        for (const auto& entry : sinks_)
+            if (entry.second.name == name) return true;
         return false;
+    }
+
+    std::string bestSink() const {
+        const SinkInfo* best = nullptr;
+        for (const auto& entry : sinks_) {
+            const SinkInfo& s = entry.second;
+            if (!best || s.priority > best->priority ||
+                (s.priority == best->priority && std::strtoull(s.serial.c_str(), nullptr, 10) >
+                                                     std::strtoull(best->serial.c_str(), nullptr, 10)))
+                best = &s;
+        }
+        return best ? best->name : std::string();
+    }
+
+    // Plays on the default output. When the default is this daemon's own sink, or there is no default at all,
+    // the highest-priority real output is used instead. When the default output has just disappeared, the
+    // output stays closed until WirePlumber announces the next default, so audio never lands on a device
+    // the session manager would not have chosen.
+    void refreshTarget() {
+        std::string want;
+        if (defaultName_.empty() || defaultName_ == kSinkName) {
+            want = bestSink();
+        } else if (hasSink(defaultName_)) {
+            want = defaultName_;
+        }
+        if (want.empty()) {
+            destroyOutput();
+            return;
+        }
+        adoptTarget(want);
     }
 
     void adoptTarget(const std::string& name) {
@@ -685,8 +725,13 @@ private:
         bool pinned = false;
     };
 
-    std::map<uint32_t, std::string> sinkNodes_;
-    std::map<uint32_t, std::string> sinkSerials_;
+    struct SinkInfo {
+        std::string name;
+        std::string serial;
+        int priority = 0;
+    };
+
+    std::map<uint32_t, SinkInfo> sinks_;
     std::map<uint32_t, StreamState> streams_;
     std::map<uint32_t, std::unique_ptr<Probe>> probes_;
     std::map<uint32_t, std::string> streamTargets_;

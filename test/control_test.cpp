@@ -37,6 +37,16 @@ int main() {
     assert(sa::applyCommand(round, sa::serialize(withDyn)));
     assert(round.dynamicEq);
 
+    sa::Params safe;
+    assert(!sa::applyCommand(safe, "band 1 nan"));
+    assert(!sa::applyCommand(safe, "band 1 inf"));
+    assert(!sa::applyCommand(safe, "balance nan"));
+    assert(safe.gains[0] == 0.0f && safe.balance == 0.0f);
+    assert(sa::applyCommand(safe, "band 1 1000"));
+    assert(safe.gains[0] == sa::kMaxGainDb);
+    assert(sa::applyCommand(safe, "band 2 -1000"));
+    assert(safe.gains[1] == -sa::kMaxGainDb);
+
     std::puts("control ok");
     return 0;
 }

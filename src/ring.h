@@ -39,6 +39,13 @@ public:
         return n;
     }
 
+    // Reader side only: drops the oldest frames so that at most `keep` remain.
+    void trim(size_t keep) {
+        const size_t r = r_.load(std::memory_order_relaxed);
+        const size_t have = w_.load(std::memory_order_acquire) - r;
+        if (have > keep) r_.store(r + (have - keep), std::memory_order_release);
+    }
+
     void clear() { r_.store(w_.load(std::memory_order_acquire), std::memory_order_release); }
 
 private:

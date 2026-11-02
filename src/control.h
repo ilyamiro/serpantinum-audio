@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <sstream>
@@ -10,6 +11,8 @@
 #include "dsp/params.h"
 
 namespace sa {
+
+constexpr float kMaxGainDb = 24.0f;
 
 inline const char* dynamicsName(Dynamics d) {
     switch (d) {
@@ -30,7 +33,7 @@ inline bool parseDynamics(const std::string& s, Dynamics& out) {
 inline bool parseFloat(const std::string& s, float& out) {
     char* end = nullptr;
     const float v = std::strtof(s.c_str(), &end);
-    if (end == s.c_str() || *end != '\0') return false;
+    if (end == s.c_str() || *end != '\0' || !std::isfinite(v)) return false;
     out = v;
     return true;
 }
@@ -95,6 +98,7 @@ inline bool applyCommand(Params& p, const std::string& line) {
         return false;
     }
 
+    for (float& g : next.gains) g = std::fmin(std::fmax(g, -kMaxGainDb), kMaxGainDb);
     if (next.balance < -1.0f) next.balance = -1.0f;
     if (next.balance > 1.0f) next.balance = 1.0f;
     p = next;
