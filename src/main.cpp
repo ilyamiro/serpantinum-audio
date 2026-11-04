@@ -23,6 +23,7 @@
 
 #include "control.h"
 #include "dsp/chain.h"
+#include "exclude.h"
 #include "ring.h"
 
 #ifndef SA_VERSION
@@ -486,6 +487,9 @@ private:
         const char* name = spa_dict_lookup(props, PW_KEY_NODE_NAME);
         if (name && std::strcmp(name, kOutputName) == 0) return false;
         if (spa_dict_lookup(props, PW_KEY_NODE_LINK_GROUP)) return false;
+        if (sa::isExcludedStream(spa_dict_lookup(props, PW_KEY_APP_NAME), spa_dict_lookup(props, PW_KEY_APP_PROCESS_BINARY),
+                                 spa_dict_lookup(props, PW_KEY_MEDIA_ROLE)))
+            return false;
         for (const char* key : {kTargetObjectKey, kTargetNodeKey, "node.target"}) {
             const char* target = spa_dict_lookup(props, key);
             if (target && !isOwnTarget(target) && !isCurrentOutput(target)) return false;

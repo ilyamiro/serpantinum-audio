@@ -14,6 +14,25 @@ It creates a virtual output called **Serpantinum** (`serpantinum_sink`), process
 
 The daemon leaves your default output alone. Like EasyEffects, it moves each app's playback stream onto its sink and plays the processed result on whatever the default output is, so choosing another output moves the processed audio there. When the output device disappears, the daemon waits for the session manager to pick the next default instead of guessing, and if Serpantinum itself is selected as the default it plays on the highest-priority real output. A stream that names another device, or one you move to another device yourself, is left where it is. When the daemon stops, apps go back to the default output.
 
+### Voice chat apps
+
+Voice chat apps are not processed and play directly on the output device. When you share your screen with audio, the share captures each app's playback but leaves out the voice chat app itself, so the people you are talking to do not hear their own voices. The processed mix contains every routed app, so a voice chat app routed through it would be captured inside the mix and sent back to them.
+
+The daemon skips a playback stream when its `application.name` or `application.process.binary` is one of the following, ignoring case, spaces and punctuation:
+
+| App | Names |
+| --- | --- |
+| Discord | `Discord`, `DiscordPTB`, `DiscordCanary`, and its voice engine, `WEBRTC VoiceEngine` |
+| Discord clients | `Vesktop`, `Equibop`, `Legcord`, `ArmCord`, `WebCord` |
+| Zoom | `zoom`, and its voice engine, `ZOOM VoiceEngine` |
+| Microsoft Teams | `Teams for Linux` |
+
+It also skips any stream whose `media.role` is `Communication` or `phone`, which apps set on call audio.
+
+Every stream from these apps is skipped, including music or video played in them. The decision is made once, when the stream appears, so a stream never moves while it plays. To process one anyway, move it to **Serpantinum** yourself, for example in pavucontrol.
+
+Telegram calls and calls in a browser are still processed. Their call audio cannot be told apart from their other playback.
+
 ## Usage
 
 ```

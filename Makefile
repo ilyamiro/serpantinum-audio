@@ -10,7 +10,7 @@ PREFIX ?= /usr/local
 DESTDIR ?=
 
 SOURCES := src/main.cpp $(wildcard src/*.h src/dsp/*.h)
-TESTS := dsp_test dynamic_eq_test control_test
+TESTS := dsp_test dynamic_eq_test control_test exclude_test
 
 all: $(OUT)
 
