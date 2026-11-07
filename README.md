@@ -11,6 +11,7 @@ It creates a virtual output called **Serpantinum** (`serpantinum_sink`), process
 - Compressor and look-ahead limiter in two modes, balanced and night
 - Dynamic EQ, an adaptive tonal balance that follows the music
 - Global bypass
+- A spectrum visualizer for the shell, a port of [cava](https://github.com/karlstav/cava)
 
 The daemon leaves your default output alone. Like EasyEffects, it moves each app's playback stream onto its sink and plays the processed result on whatever the default output is, so choosing another output moves the processed audio there. When the output device disappears, the daemon waits for the session manager to pick the next default instead of guessing, and if Serpantinum itself is selected as the default it plays on the highest-priority real output. A stream that names another device, or one you move to another device yourself, is left where it is. When the daemon stops, apps go back to the default output.
 
@@ -39,6 +40,7 @@ Telegram calls and calls in a browser are still processed. Their call audio cann
 serpantinum-audio daemon          run in the foreground
 serpantinum-audio start           start in the background unless already running, wait until it answers
 serpantinum-audio ctl <command>   send one command and print the reply
+serpantinum-audio visualizer      print spectrum frames, see below
 serpantinum-audio version         print the version
 ```
 
@@ -73,6 +75,36 @@ serpantinum-audio ctl set 2 1 0 0 0 0 0 1 2 3 0 0 0 off 0 1
 | `$XDG_STATE_HOME/serpantinum/audio.state` | last settings, restored on start |
 | `$XDG_STATE_HOME/serpantinum/audio.log` | log of the background daemon |
 | `$XDG_RUNTIME_DIR/serpantinum/audio-target` | name and PipeWire id of the real output device |
+
+## Visualizer
+
+`serpantinum-audio visualizer` captures the default output and prints the spectrum as one JSON array of bar heights from 0 to 1 per line:
+
+```
+[0.12,0.31,0.86,1,0.44,0]
+```
+
+It runs on its own, separately from the daemon, and does no work unless something reads it: the shell starts it while music plays and stops it afterwards. A frame equal to the previous one is not printed. When the audio goes silent, the bars fall, a single frame of zeros is printed and the visualizer sleeps until sound returns. Its capture stream is passive, so it never keeps an output device awake.
+
+The processing is a port of cava 1.0.0: two Hann-windowed FFTs (8192 points below 100 Hz, 4096 above), bars spaced logarithmically between the cutoffs, gravity falloff, integral smoothing and automatic sensitivity, followed by cava's equalizer, monstercat smoothing and channel layout. With the same settings, the bars match cava's raw output. The options match cava's processing settings:
+
+| Option | Default | cava setting |
+| --- | --- | --- |
+| `--bars N` | 64 | `bars`, even in stereo |
+| `--framerate N` | 60 | `framerate` |
+| `--sensitivity N` | 100 | `sensitivity` in percent, applied on top of autosens as in cava 1.0.0 |
+| `--autosens 0\|1` | 1 | `autosens` |
+| `--noise-reduction N` | 77 | `noise_reduction`, 0 to 100 |
+| `--lower-cutoff HZ`, `--higher-cutoff HZ` | 50, 8000 | `lower_cutoff_freq`, `higher_cutoff_freq` |
+| `--channels stereo\|mono` | stereo | `channels`: stereo mirrors the left channel on the left half and the right channel on the right half, with the bass in the centre |
+| `--mono-option average\|left\|right` | average | `mono_option` |
+| `--reverse 0\|1` | 0 | `reverse` |
+| `--monstercat N`, `--waves 0\|1` | 0, 0 | `monstercat`, `waves` |
+| `--eq LIST` | off | the `[eq]` section, as comma separated gains |
+| `--source NAME` | auto | `source`: `auto` (default output), `auto_input`, a node name or `<sink>.monitor` |
+| `--sample-rate N` | 48000 | `sample_rate` |
+
+`serpantinum-audio visualizer --help` lists them. Invalid options exit with status 64, and a lost PipeWire connection with status 1.
 
 ## Dynamic EQ
 
@@ -141,4 +173,4 @@ Pushing a `v*` tag that matches `VERSION` builds `x86_64` and `aarch64` binaries
 
 ## License
 
-AGPL-3.0-only, like Serpantinum.
+AGPL-3.0-only, like Serpantinum. The visualizer in `src/dsp/visualizer.h` is ported from cava, MIT, Copyright (c) 2022 Karl Stavestrand; the notice is kept in that file.

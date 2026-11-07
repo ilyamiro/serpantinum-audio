@@ -20,11 +20,13 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <vector>
 
 #include "control.h"
 #include "dsp/chain.h"
 #include "exclude.h"
 #include "ring.h"
+#include "visualizer_cli.h"
 
 #ifndef SA_VERSION
 #define SA_VERSION "dev"
@@ -760,6 +762,245 @@ private:
     bool primed_ = false;
 };
 
+class VisualizerStream {
+public:
+    explicit VisualizerStream(const sa::VisualizerConfig& cfg) : cfg_(cfg) {}
+
+    int run() {
+        std::string error;
+        if (!vis_.init(cfg_.options, error)) {
+            std::fprintf(stderr, "serpantinum-audio: %s\n", error.c_str());
+            return 64;
+        }
+        const sa::VisualizerOptions& o = vis_.options();
+        in_.assign(vis_.inputSize(), 0.0);
+        samplesPerFrame_ = o.sampleRate / o.framerate;
+        highFramerate_ = samplesPerFrame_ < kBufferFrames;
+
+        pw_init(nullptr, nullptr);
+        loop_ = pw_main_loop_new(nullptr);
+        if (!loop_) return 1;
+        pw_loop* loop = pw_main_loop_get_loop(loop_);
+        pw_loop_add_signal(loop, SIGINT, onSignal, this);
+        pw_loop_add_signal(loop, SIGTERM, onSignal, this);
+        signal(SIGPIPE, SIG_IGN);
+
+        context_ = pw_context_new(loop, nullptr, 0);
+        core_ = context_ ? pw_context_connect(context_, nullptr, 0) : nullptr;
+        if (!core_) {
+            std::fprintf(stderr, "serpantinum-audio: cannot connect to PipeWire\n");
+            return 1;
+        }
+        coreEvents_.version = PW_VERSION_CORE_EVENTS;
+        coreEvents_.error = onCoreError;
+        pw_core_add_listener(core_, &coreListener_, &coreEvents_, this);
+
+        timer_ = pw_loop_add_timer(loop, onTimer, this);
+        if (!connect()) {
+            std::fprintf(stderr, "serpantinum-audio: cannot connect the capture stream\n");
+            status_ = 1;
+        } else {
+            wake();
+            pw_main_loop_run(loop_);
+        }
+
+        if (stream_) {
+            spa_hook_remove(&streamListener_);
+            pw_stream_destroy(stream_);
+        }
+        if (timer_) pw_loop_destroy_source(loop, timer_);
+        pw_core_disconnect(core_);
+        pw_context_destroy(context_);
+        pw_main_loop_destroy(loop_);
+        pw_deinit();
+        return status_;
+    }
+
+private:
+    static constexpr int kBufferFrames = 512;
+
+    bool connect() {
+        const sa::VisualizerOptions& o = vis_.options();
+        pw_properties* props = pw_properties_new(
+            PW_KEY_MEDIA_TYPE, "Audio", PW_KEY_MEDIA_CATEGORY, "Capture", PW_KEY_MEDIA_ROLE, "Music", PW_KEY_NODE_NAME,
+            "serpantinum_visualizer", PW_KEY_NODE_DESCRIPTION, "Serpantinum visualizer", PW_KEY_APP_NAME,
+            "Serpantinum visualizer", PW_KEY_APP_ID, "serpantinum", PW_KEY_NODE_PASSIVE, "true", PW_KEY_NODE_VIRTUAL,
+            "true", PW_KEY_STREAM_DONT_REMIX, "false", "channelmix.upmix", "true", nullptr);
+        std::string source = cfg_.source;
+        const std::string monitor = ".monitor";
+        if (source.size() >= monitor.size() && source.compare(source.size() - monitor.size(), monitor.size(), monitor) == 0) {
+            source.resize(source.size() - monitor.size());
+            pw_properties_set(props, PW_KEY_STREAM_CAPTURE_SINK, "true");
+        }
+        if (source == "auto") pw_properties_set(props, PW_KEY_STREAM_CAPTURE_SINK, "true");
+        else if (source != "auto_input") pw_properties_set(props, PW_KEY_TARGET_OBJECT, source.c_str());
+        uint32_t quantum = 1;
+        while (quantum < static_cast<uint32_t>(kBufferFrames * static_cast<long>(o.sampleRate) / 48000)) quantum <<= 1;
+        pw_properties_setf(props, PW_KEY_NODE_LATENCY, "%u/%d", quantum, o.sampleRate);
+
+        streamEvents_.version = PW_VERSION_STREAM_EVENTS;
+        streamEvents_.process = onProcess;
+        streamEvents_.state_changed = onState;
+        stream_ = pw_stream_new(core_, "serpantinum-visualizer", props);
+        if (!stream_) return false;
+        pw_stream_add_listener(stream_, &streamListener_, &streamEvents_, this);
+
+        uint8_t buffer[1024];
+        spa_pod_builder b = SPA_POD_BUILDER_INIT(buffer, sizeof buffer);
+        spa_audio_info_raw info{};
+        info.format = SPA_AUDIO_FORMAT_S16;
+        info.rate = static_cast<uint32_t>(o.sampleRate);
+        info.channels = sa::CavaCore::kChannels;
+        info.position[0] = SPA_AUDIO_CHANNEL_FL;
+        info.position[1] = SPA_AUDIO_CHANNEL_FR;
+        const spa_pod* params[1] = {spa_format_audio_raw_build(&b, SPA_PARAM_EnumFormat, &info)};
+        return pw_stream_connect(stream_, PW_DIRECTION_INPUT, PW_ID_ANY,
+                                 static_cast<pw_stream_flags>(PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS),
+                                 params, 1) == 0;
+    }
+
+    void quit(int status) {
+        status_ = status;
+        pw_main_loop_quit(loop_);
+    }
+
+    static void onSignal(void* data, int) { static_cast<VisualizerStream*>(data)->quit(0); }
+
+    static void onCoreError(void* data, uint32_t id, int, int res, const char* message) {
+        if (id != PW_ID_CORE || res != -EPIPE) return;
+        std::fprintf(stderr, "serpantinum-audio: PipeWire connection lost: %s\n", message);
+        static_cast<VisualizerStream*>(data)->quit(1);
+    }
+
+    static void onState(void* data, pw_stream_state, pw_stream_state state, const char* error) {
+        VisualizerStream* self = static_cast<VisualizerStream*>(data);
+        if (state == PW_STREAM_STATE_PAUSED) {
+            self->resetInput();
+        } else if (state == PW_STREAM_STATE_ERROR || state == PW_STREAM_STATE_UNCONNECTED) {
+            std::fprintf(stderr, "serpantinum-audio: capture stream %s%s%s\n",
+                         state == PW_STREAM_STATE_ERROR ? "error" : "disconnected", error ? ": " : "", error ? error : "");
+            self->quit(1);
+        }
+    }
+
+    // Like cava when its stream pauses: fill the input with silence so the bars fall instead of freezing.
+    void resetInput() {
+        std::fill(in_.begin(), in_.end(), 0.0);
+        count_ = static_cast<int>(in_.size());
+        wake();
+    }
+
+    static void onProcess(void* data) { static_cast<VisualizerStream*>(data)->capture(); }
+
+    void capture() {
+        pw_buffer* b = pw_stream_dequeue_buffer(stream_);
+        if (!b) return;
+        const spa_data& d = b->buffer->datas[0];
+        if (d.data && d.chunk) {
+            const int samples = static_cast<int>(d.chunk->size / sizeof(int16_t));
+            const int16_t* src = reinterpret_cast<const int16_t*>(static_cast<const uint8_t*>(d.data) + d.chunk->offset);
+            bool audible = false;
+            for (int i = 0; i < samples && !audible; ++i) audible = src[i] != 0;
+            if (audible) wake();
+            if (!sleeping_) push(src, samples);
+            lastInput_ = now();
+            stalled_ = false;
+        }
+        pw_stream_queue_buffer(stream_, b);
+    }
+
+    void push(const int16_t* src, int samples) {
+        if (samples <= 0) return;
+        const int size = static_cast<int>(in_.size());
+        if (count_ + samples > size) {
+            std::fill(in_.begin(), in_.end(), 0.0);
+            count_ = 0;
+        }
+        const int n = std::min(samples, size);
+        for (int i = 0; i < n; ++i) in_[count_ + i] = src[i];
+        count_ += n;
+    }
+
+    static uint64_t now() {
+        timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull + static_cast<uint64_t>(ts.tv_nsec);
+    }
+
+    void wake() {
+        if (!sleeping_) return;
+        sleeping_ = false;
+        const long period = 1000000000L / vis_.options().framerate;
+        timespec value{0, 1}, interval{period / 1000000000L, period % 1000000000L};
+        pw_loop_update_timer(pw_main_loop_get_loop(loop_), timer_, &value, &interval, false);
+    }
+
+    void sleep() {
+        sleeping_ = true;
+        count_ = 0;
+        pw_loop_update_timer(pw_main_loop_get_loop(loop_), timer_, nullptr, nullptr, false);
+    }
+
+    static void onTimer(void* data, uint64_t) { static_cast<VisualizerStream*>(data)->frame(); }
+
+    void frame() {
+        if (count_ == 0 && lastInput_ && now() - lastInput_ > kStallNs && !stalled_) {
+            stalled_ = true;
+            resetInput();
+        }
+
+        bool silence = true;
+        for (int n = 0; n < count_ && silence; ++n) silence = in_[n] == 0.0;
+
+        int use = count_;
+        if (highFramerate_) {
+            use = samplesPerFrame_ * sa::CavaCore::kChannels;
+            if (count_ < use) use = count_;
+            if (count_ > kBufferFrames * sa::CavaCore::kChannels + use) use = count_ - kBufferFrames * sa::CavaCore::kChannels;
+        }
+        const std::vector<int>& bars = vis_.execute(in_.data(), use);
+        count_ -= use;
+        if (count_ > 0) std::memmove(in_.data(), in_.data() + use, sizeof(double) * count_);
+
+        if (bars != last_) {
+            last_ = bars;
+            sa::formatFrame(bars, vis_.options().range, line_);
+            if (write(STDOUT_FILENO, line_.data(), line_.size()) != static_cast<ssize_t>(line_.size())) {
+                quit(0);
+                return;
+            }
+        }
+
+        bool idle = silence;
+        for (int v : bars) idle = idle && v == 0;
+        if (idle) sleep();
+    }
+
+    static constexpr uint64_t kStallNs = 250000000ull;
+
+    sa::VisualizerConfig cfg_;
+    sa::Visualizer vis_;
+    std::vector<double> in_;
+    std::vector<int> last_;
+    std::string line_;
+    int count_ = 0;
+    int samplesPerFrame_ = 0;
+    bool highFramerate_ = false;
+    bool sleeping_ = true;
+    bool stalled_ = false;
+    uint64_t lastInput_ = 0;
+    int status_ = 0;
+
+    pw_main_loop* loop_ = nullptr;
+    pw_context* context_ = nullptr;
+    pw_core* core_ = nullptr;
+    pw_stream* stream_ = nullptr;
+    spa_source* timer_ = nullptr;
+    spa_hook coreListener_{}, streamListener_{};
+    pw_core_events coreEvents_{};
+    pw_stream_events streamEvents_{};
+};
+
 int startDetached(const char* self) {
     std::string reply;
     if (request("ping", reply)) return 0;
@@ -808,6 +1049,23 @@ int main(int argc, char** argv) {
         return startDetached(self);
     }
 
+    if (cmd == "visualizer") {
+        std::vector<std::string> args(argv + 2, argv + argc);
+        for (const std::string& a : args) {
+            if (a == "--help" || a == "-h") {
+                std::printf("%s", sa::kVisualizerUsage);
+                return 0;
+            }
+        }
+        sa::VisualizerConfig cfg;
+        std::string error;
+        if (!sa::parseVisualizerArgs(args, cfg, error)) {
+            std::fprintf(stderr, "serpantinum-audio: %s\n%s", error.c_str(), sa::kVisualizerUsage);
+            return 64;
+        }
+        return VisualizerStream(cfg).run();
+    }
+
     if (cmd == "ctl" && argc > 2) {
         std::string line;
         for (int i = 2; i < argc; ++i) line += (i > 2 ? " " : "") + std::string(argv[i]);
@@ -820,6 +1078,6 @@ int main(int argc, char** argv) {
         return reply.rfind("ok", 0) == 0 || reply.rfind("set", 0) == 0 ? 0 : 1;
     }
 
-    std::fprintf(stderr, "usage: serpantinum-audio daemon | start | ctl <command...> | version\n");
+    std::fprintf(stderr, "usage: serpantinum-audio daemon | start | ctl <command...> | visualizer [options] | version\n");
     return 64;
 }
